@@ -304,7 +304,18 @@ class Command(EnvCommand):
                                  'exists, replace it')
 
     def handle(self, *args, **options):
-        if options['target']:
-            _handle_with_file(*args, **options)
+        # The 'project' option is not exposed as a command-line argument: it is
+        # typically used when creating a custom project programatically. It
+        # provides a class that is instantiated with the current command-line
+        # arguments and options
+        proj_class = options.get('project')
+        if proj_class:
+            if not isinstance(proj_class, AbstractProject):
+                raise CommandError('Custom projects must be a subclass of '
+                                   'AbstractProject')
+            proj = proj_class(*args, **options)
+            call_command(proj, *args, **options)
+        elif options['target']:
+            _handle_with_file(options.pop('target'), *args, **options)
         else:
             _handle_empty_project(*args, **options)
