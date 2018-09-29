@@ -91,13 +91,12 @@ def _symlink_target_files(project_dir, files):
         os.symlink(f, os.path.join(project_dir, target_file))
 
 
-def _symlink_guestfs(project_dir, config):
+def _symlink_guestfs(project_dir, guestfs_path):
     """
     Create a symlink to the guestfs directory.
 
     Return ``True`` if the guestfs directory exists, or ``False`` otherwise.
     """
-    guestfs_path = config['guestfs_path']
     logger.info('Creating a symlink to %s', guestfs_path)
     os.symlink(guestfs_path, os.path.join(project_dir, 'guestfs'))
 
@@ -115,10 +114,132 @@ def _create_instructions(config):
     return re.sub(r'([\r\n][\r\n])+', r'\n\n', instructions)
 
 
-class Project(EnvCommand):
+class AbstractProject(EnvCommand):
     """
-    Helper class used by the ``new_project`` command to create a specific
-    project.
+    An abstract class for creating S2E analysis projects.
+
+    This class must be overridden and the `make_project` method implemented.
+    It provides convenience methods for deciding on the virtual machine image
+    to use.
+    """
+
+    def handle(self, *args, **options):
+        self.make_project(*args, **options)
+
+    def make_project(self, *args, **kwargs):
+        """
+        The main method that must be overridden for creating new S2E analysis
+        projects.
+        """
+        raise NotImplementedError('Subclasses of AbstractProject must provide '
+                                  'a make_project method')
+
+    def _is_image_valid(self, target_arch, target_path, os_desc):
+        """
+        Validate a binary against a particular image description.
+
+        This validation may vary depending on the binary and image type.
+        Returns ``True`` if the binary is valid and ``False`` otherwise.
+        """
+        pass
+
+    def _select_image(self, target_path, target_arch, image=None, download_image=True):
+        """
+        Select an image to use for this project.
+
+        If an image was specified, use it. Otherwise select an image to use
+        based on the target's architecture. If the image is not available, it
+        may be downloaded.
+
+        Returns:
+            A dictionary that describes the image that will be used, based on
+            the image's JSON descriptor.
+        """
+        # Load the image JSON description. If it is not given, guess the image
+        img_build_dir = self.source_path(CONSTANTS['repos']['images']['build'])
+        img_templates = get_image_templates(img_build_dir)
+
+        if not image:
+            image = self._guess_image(target_path, img_templates, target_arch)
+
+        return self._get_or_download_image(img_templates, image, download_image)
+
+    def _guess_image(self, target_path, templates, target_arch):
+        """
+        At this stage, images may not exist, so we get the list of images
+        from images.json (in the guest-images repo) rather than from the images
+        folder.
+        """
+        logger.info('No image was specified (-i option). Attempting to guess '
+                    'a suitable image for a %s binary...', target_arch)
+
+        for k, v in templates.iteritems():
+            if self._is_image_valid(target_arch, target_path, v['os']):
+                logger.warning('Found %s, which looks suitable for this '
+                               'binary. Please use -i if you want to use '
+                               'another image', k)
+                return k
+
+        raise CommandError('No suitable image available for this binary')
+
+    def _get_or_download_image(self, templates, image, do_download=True):
+        img_path = self.image_path(image)
+
+        try:
+            return get_image_descriptor(img_path)
+        except CommandError:
+            if not do_download:
+                raise
+
+        logger.info('Image %s missing, attempting to download...', image)
+        image_downloader = ImageDownloader(templates)
+        image_downloader.download_images([image], self.image_path())
+
+        return get_image_descriptor(img_path)
+
+    def _select_guestfs(self, img_desc):
+        """
+        Select the guestfs to use, based on the chosen virtual machine image.
+
+        Args:
+            img_desc: An image descriptor read from the image's JSON
+            description.
+
+        Returns:
+            The path to the guestfs directory, or `None` if a suitable guestfs
+            was not found.
+        """
+        image_dir = os.path.dirname(img_desc['path'])
+        guestfs_path = self.image_path(image_dir, 'guestfs')
+
+        return guestfs_path if os.path.exists(guestfs_path) else None
+
+    def _symlink_guest_tools(self, project_dir, img_desc):
+        """
+        Create a symlink to the guest tools directory.
+
+        Args:
+            project_dir: The project directory.
+            img_desc: A dictionary that describes the image that will be used,
+                      from `$S2EDIR/source/guest-images/images.json`.
+        """
+        img_arch = img_desc['qemu_build']
+        guest_tools_path = \
+            self.install_path('bin', CONSTANTS['guest_tools'][img_arch])
+
+        logger.info('Creating a symlink to %s', guest_tools_path)
+        os.symlink(guest_tools_path,
+                   os.path.join(project_dir, 'guest-tools'))
+
+
+class Project(AbstractProject):
+    """
+    Base class used by the ``new_project`` command to create a specific
+    project. The ``make_project`` method builds up a configuration dictionary
+    that is then used to generate the required files for the project. CGC,
+    Linux and Windows projects extend this class. These projects implement
+    methods to validate the configuration dictionary and do basic static
+    analysis on the target.
     """
 
     def __init__(self, project_type, bootstrap_template, lua_template):
@@ -128,7 +249,7 @@ class Project(EnvCommand):
         self._bootstrap_template = bootstrap_template
         self._lua_template = lua_template
 
-    def handle(self, *args, **options):
+    def make_project(self, *args, **options):
         # Check that the target files are valid
         target_files = options['target_files']
         if target_files:
@@ -148,7 +269,9 @@ class Project(EnvCommand):
         target_arch = options['target_arch']
 
         # Decide on the image to be used
-        img_desc = self._select_image(target_path, target_arch, options)
+        img_desc = self._select_image(target_path, target_arch,
+                                      options['image'],
+                                      options['download_image'])
 
         # Check architecture consistency (if the target has been specified)
         if target_path and not is_valid_arch(target_arch, img_desc['os']):
@@ -162,7 +285,8 @@ class Project(EnvCommand):
             logger.warn('No guestfs available. The VMI plugin may not run optimally')
 
         # Create an empty project directory
-        project_dir = self._create_project_dir(target_path, options)
+        project_dir = self._create_project_dir(target_path, options['name'],
+                                               options['force'])
 
         # Prepare the project configuration
         config = {
@@ -219,7 +343,7 @@ class Project(EnvCommand):
 
             # This will add analysis overhead, so disable unless requested by
             # the user. Also enabled by default for Decree targets.
-            'enable_pov_generation': options['enable_pov_generation']
+            'enable_pov_generation': options['enable_pov_generation'],
         }
 
         # Do some basic analysis on the target (if it exists)
@@ -241,11 +365,11 @@ class Project(EnvCommand):
             _symlink_target_files(project_dir, target_files)
 
         # Create a symlink to the guest tools directory
-        self._symlink_guest_tools(project_dir, config)
+        self._symlink_guest_tools(project_dir, img_desc)
 
         # Create a symlink to guestfs (if it exists)
         if guestfs_path:
-            _symlink_guestfs(project_dir, config)
+            _symlink_guestfs(project_dir, guestfs_path)
 
         # Render the templates
         self._create_launch_script(project_dir, config)
@@ -285,16 +409,6 @@ class Project(EnvCommand):
                            'this intentional?')
 
         logger.success(_create_instructions(config))
-
-    def _is_image_valid(self, target_arch, target_path, os_desc):
-        """
-        Validate a binary against a particular image description.
-
-        This validation may vary depending on the binary and image type.
-        Returns ``True`` if the binary is valid and ``False`` otherwise.
-        """
-        raise NotImplementedError('Subclasses of Project must provide an '
-                                  '_is_image_valid method')
 
     def _validate_config(self, config):
         """
@@ -399,8 +513,7 @@ class Project(EnvCommand):
         script_path = os.path.join(project_dir, template)
         render_template(context, template, script_path)
 
-    def _create_project_dir(self, target_path, options):
-        project_name = options['name']
+    def _create_project_dir(self, target_path, project_name=None, force=False):
         if not project_name:
             # The default project name is the target program without any file
             # extension
@@ -409,87 +522,9 @@ class Project(EnvCommand):
         project_dir = self.env_path('projects', project_name)
 
         # Check if the project directory already exists
-        _check_project_dir(project_dir, options['force'])
+        _check_project_dir(project_dir, force)
 
         # Create the project directory
         os.mkdir(project_dir)
 
         return project_dir
-
-    def _select_image(self, target_path, target_arch, options):
-        """
-        Select the image to use for this project.
-
-        If an image was specified, use it. Otherwise select an image to use
-        based on the target's architecture. If the image is not available, it
-        may be downloaded.
-
-        Returns:
-            A dictionary that describes the image that will be used, from
-            `$S2EDIR/source/guest-images/images.json`.
-        """
-        # Load the image JSON description. If it is not given, guess the image
-        image = options['image']
-        img_build_dir = self.source_path(CONSTANTS['repos']['images']['build'])
-        img_templates = get_image_templates(img_build_dir)
-
-        if not image:
-            image = self._guess_image(target_path, img_templates, target_arch)
-
-        return self._get_or_download_image(img_templates, image, options['download_image'])
-
-    def _guess_image(self, target_path, templates, target_arch):
-        """
-        At this stage, images may not exist, so we get the list of images
-        from images.json (in the guest-images repo) rather than from the images
-        folder.
-        """
-        logger.info('No image was specified (-i option). Attempting to guess '
-                    'a suitable image for a %s binary...', target_arch)
-
-        for k, v in templates.iteritems():
-            if self._is_image_valid(target_arch, target_path, v['os']):
-                logger.warning('Found %s, which looks suitable for this '
-                               'binary. Please use -i if you want to use '
-                               'another image', k)
-                return k
-
-        raise CommandError('No suitable image available for this binary')
-
-    def _get_or_download_image(self, templates, image, do_download=True):
-        img_path = self.image_path(image)
-
-        try:
-            return get_image_descriptor(img_path)
-        except CommandError:
-            if not do_download:
-                raise
-
-        logger.info('Image %s missing, attempting to download...', image)
-        image_downloader = ImageDownloader(templates)
-        image_downloader.download_images([image], self.image_path())
-
-        return get_image_descriptor(img_path)
-
-    def _select_guestfs(self, img_desc):
-        image_dir = os.path.dirname(img_desc['path'])
-        guestfs_path = self.image_path(image_dir, 'guestfs')
-
-        return guestfs_path if os.path.exists(guestfs_path) else None
-
-    def _symlink_guest_tools(self, project_dir, img_desc):
-        """
-        Create a symlink to the guest tools directory.
-
-        Args:
-            project_dir: The project directory.
-            img_desc: A dictionary that describes the image that will be used,
-                      from `$S2EDIR/source/guest-images/images.json`.
-        """
-        img_arch = img_desc['qemu_build']
-        guest_tools_path = \
-            self.install_path('bin', CONSTANTS['guest_tools'][img_arch])
-
-        logger.info('Creating a symlink to %s', guest_tools_path)
-        os.symlink(guest_tools_path,
-                   os.path.join(project_dir, 'guest-tools'))
